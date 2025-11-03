@@ -96,134 +96,126 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
-from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
+
+
 import os
-from glob import glob
-from sklearn.neural_network import MLPClassifier
-import pandas as pd
+import json
 import gzip
 import pickle
-import json
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from glob import glob
+from pathlib import Path
+
+import pandas as pd
 from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score, confusion_matrix
 
-df_train = pd.read_csv("./files/input/train_data.csv.zip", index_col=False, compression="zip")
-df_test = pd.read_csv("./files/input/test_data.csv.zip", index_col=False, compression="zip")
 
-df_train_clean = df_train.copy()
-df_test_clean = df_test.copy()
+# Carga y limpieza de datos
+def cargar_datos(ruta):
+    df = pd.read_csv(ruta, compression="zip")
+    df = df.rename(columns={"default payment next month": "default"})
+    if "ID" in df.columns:
+        df = df.drop(columns="ID")
+    df = df[(df["MARRIAGE"] != 0) & (df["EDUCATION"] != 0)]
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+    return df.dropna()
 
-df_train_clean = df_train_clean.rename(columns={'default payment next month': "default"})
-df_test_clean = df_test_clean.rename(columns={'default payment next month': "default"})
 
-df_train_clean = df_train_clean.drop(columns=["ID"])
-df_test_clean = df_test_clean.drop(columns=["ID"])
+# Métricas y matriz de confusión
+def calcular_metricas(nombre, y_real, y_pred):
+    return {
+        "type": "metrics",
+        "dataset": nombre,
+        "precision": precision_score(y_real, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_real, y_pred),
+        "recall": recall_score(y_real, y_pred, zero_division=0),
+        "f1_score": f1_score(y_real, y_pred, zero_division=0),
+    }
 
-df_train_clean = df_train_clean.loc[df_train_clean["MARRIAGE"] != 0]
-df_test_clean = df_test_clean.loc[df_test_clean["MARRIAGE"] != 0]
 
-df_train_clean = df_train_clean.loc[df_train_clean["EDUCATION"] != 0]
-df_test_clean = df_test_clean.loc[df_test_clean["EDUCATION"] != 0]
+def matriz_conf(nombre, y_real, y_pred):
+    tn, fp, fn, tp = confusion_matrix(y_real, y_pred).ravel()
+    return {
+        "type": "cm_matrix",
+        "dataset": nombre,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
 
-df_train_clean["EDUCATION"] = df_train_clean["EDUCATION"].apply(lambda x: 4 if x >= 4 else x)
-df_test_clean["EDUCATION"] = df_test_clean["EDUCATION"].apply(lambda x: 4 if x >= 4 else x)
 
-df_train_clean = df_train_clean.dropna()
-df_test_clean = df_test_clean.dropna()
+def main():
+    # Cargar datos
+    train = cargar_datos("files/input/train_data.csv.zip")
+    test = cargar_datos("files/input/test_data.csv.zip")
 
-x_train = df_train_clean.drop(columns=["default"])
-y_train = df_train_clean["default"]
-x_test = df_test_clean.drop(columns=["default"])
-y_test = df_test_clean["default"]
+    X_train = train.drop(columns="default")
+    y_train = train["default"]
+    X_test = test.drop(columns="default")
+    y_test = test["default"]
 
-categorical_cols = ["SEX", "EDUCATION", "MARRIAGE"]
-numerical_cols = [col for col in x_train.columns if col not in categorical_cols]
+    cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+    num_cols = [c for c in X_train.columns if c not in cat_cols]
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('categorical', OneHotEncoder(), categorical_cols),
-        ('scaling', StandardScaler(), numerical_cols),
+    # Preprocesamiento
+    pre = ColumnTransformer([
+        ("cat", OneHotEncoder(), cat_cols),
+        ("num", StandardScaler(), num_cols)
+    ])
+
+    # Modelo
+    modelo = Pipeline([
+        ("pre", pre),
+        ("sel", SelectKBest(score_func=f_classif, k=20)),
+        ("pca", PCA(n_components=None)),
+        ("clf", MLPClassifier(
+            hidden_layer_sizes=(50, 30, 40, 60),
+            alpha=0.26,
+            learning_rate_init=0.001,
+            max_iter=15000,
+            random_state=21
+        ))
+    ])
+
+    # Búsqueda de hiperparámetros
+    grid = GridSearchCV(modelo, param_grid={}, cv=10, scoring="balanced_accuracy", n_jobs=-1)
+    grid.fit(X_train, y_train)
+
+    # Limpieza del directorio de modelos
+    model_dir = Path("files/models")
+    if model_dir.exists():
+        for f in glob(str(model_dir / "*")):
+            os.remove(f)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # Guardar modelo entrenado
+    with gzip.open(model_dir / "model.pkl.gz", "wb") as f:
+        pickle.dump(grid, f)
+
+    # Predicciones
+    y_pred_train = grid.predict(X_train)
+    y_pred_test = grid.predict(X_test)
+
+    # Resultados
+    resultados = [
+        calcular_metricas("train", y_train, y_pred_train),
+        calcular_metricas("test", y_test, y_pred_test),
+        matriz_conf("train", y_train, y_pred_train),
+        matriz_conf("test", y_test, y_pred_test),
     ]
-)
 
-pipeline = Pipeline([
-    ("data_preprocessor", preprocessor),
-    ('feature_selector', SelectKBest(score_func=f_classif)),
-    ('dim_reduction', PCA()),
-    ('mlp_classifier', MLPClassifier(max_iter=15000, random_state=21))
-])
+    # Guardar métricas
+    out_dir = Path("files/output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
+        for r in resultados:
+            f.write(json.dumps(r) + "\n")
 
-param_grid = {
-    "dim_reduction__n_components": [None],
-    "feature_selector__k": [20],
-    "mlp_classifier__hidden_layer_sizes": [(50, 30, 40, 60)],
-    "mlp_classifier__alpha": [0.26],
-    'mlp_classifier__learning_rate_init': [0.001],
-}
 
-grid_search = GridSearchCV(
-    estimator=pipeline,
-    param_grid=param_grid,
-    cv=10,
-    scoring='balanced_accuracy',
-    n_jobs=-1,
-    refit=True
-)
-
-grid_search.fit(x_train, y_train)
-
-if os.path.exists("files/models/"):
-    for file in glob(f"files/models/*"):
-        os.remove(file)
-    os.rmdir("files/models/")
-os.makedirs("files/models/")
-
-with gzip.open("files/models/model.pkl.gz", "wb") as f:
-    pickle.dump(grid_search, f)
-
-y_test_pred = grid_search.predict(x_test)
-test_metrics = {
-    "type": "metrics",
-    "dataset": "test",
-    "precision": precision_score(y_test, y_test_pred, zero_division=0),
-    "balanced_accuracy": balanced_accuracy_score(y_test, y_test_pred),
-    "recall": recall_score(y_test, y_test_pred, zero_division=0),
-    "f1_score": f1_score(y_test, y_test_pred, zero_division=0),
-}
-
-y_train_pred = grid_search.predict(x_train)
-train_metrics = {
-    "type": "metrics",
-    "dataset": "train",
-    "precision": precision_score(y_train, y_train_pred, zero_division=0),
-    "balanced_accuracy": balanced_accuracy_score(y_train, y_train_pred),
-    "recall": recall_score(y_train, y_train_pred, zero_division=0),
-    "f1_score": f1_score(y_train, y_train_pred, zero_division=0),
-}
-
-test_conf_matrix = {
-    "type": "cm_matrix",
-    "dataset": "test",
-    "true_0": {"predicted_0": int(confusion_matrix(y_test, y_test_pred)[0][0]), "predicted_1": int(confusion_matrix(y_test, y_test_pred)[0][1])},
-    "true_1": {"predicted_0": int(confusion_matrix(y_test, y_test_pred)[1][0]), "predicted_1": int(confusion_matrix(y_test, y_test_pred)[1][1])},
-}
-
-train_conf_matrix = {
-    "type": "cm_matrix",
-    "dataset": "train",
-    "true_0": {"predicted_0": int(confusion_matrix(y_train, y_train_pred)[0][0]), "predicted_1": int(confusion_matrix(y_train, y_train_pred)[0][1])},
-    "true_1": {"predicted_0": int(confusion_matrix(y_train, y_train_pred)[1][0]), "predicted_1": int(confusion_matrix(y_train, y_train_pred)[1][1])},
-}
-
-os.makedirs("files/output/", exist_ok=True)
-
-with open("files/output/metrics.json", "w", encoding="utf-8") as file:
-    file.write(json.dumps(train_metrics) + "\n")
-    file.write(json.dumps(test_metrics) + "\n")
-    file.write(json.dumps(train_conf_matrix) + "\n")
-    file.write(json.dumps(test_conf_matrix) + "\n")
+if __name__ == "__main__":
+    main()
